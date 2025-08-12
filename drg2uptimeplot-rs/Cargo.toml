@@ -1,0 +1,12 @@
+[package]
+name = "drg2uptimeplot-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.32.0"
+egui_plot = "0.33.0"
+astro = "2.0.0"
+blh = "0.3.0"
