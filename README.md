@@ -9,3 +9,7 @@ Python version
 Rust version  
 Install: cargo install --path . 
 
+# Example
+drg2uptimeplot-rs drg2uptimeplot-rs/I23267SW.DRG   
+![](drg2uptimeplot-rs/I23267SW_azel.png)   
+![](drg2uptimeplot-rs/I23267SW_polar.png)    
