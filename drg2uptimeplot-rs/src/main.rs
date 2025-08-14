@@ -25,7 +25,8 @@ struct Cli {
 // --- Data Structures ---
 #[derive(Debug, Clone)]
 struct Source {
-    name: String,
+    name1: String,
+    name2: String,
     ra_rad: f64,
     dec_rad: f64,
 }
@@ -79,7 +80,7 @@ impl DrgPlotApp {
             Color32::from_rgb(130, 255, 255), // Cyan
         ];
 
-        let mut unique_sources = drg_data.sources.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+        let mut unique_sources = drg_data.sources.iter().map(|s| s.name2.clone()).collect::<Vec<_>>();
         unique_sources.sort();
         unique_sources.dedup();
 
@@ -251,7 +252,7 @@ fn calculate_observation_segments(station: &Station, sources: &[Source], schedul
     let ant_pos = station.pos;
 
     for obs in schedule {
-        if let Some(source) = sources.iter().find(|s| s.name == obs.source_name) {
+        if let Some(source) = sources.iter().find(|s| s.name1 == obs.source_name || s.name2 == obs.source_name) {
             let mut az_segment = Vec::new();
             let mut el_segment = Vec::new();
 
@@ -275,7 +276,7 @@ fn calculate_observation_segments(station: &Station, sources: &[Source], schedul
                 }
                 current_time += Duration::minutes(1);
             }
-            new_plot_data.push((source.name.clone(), az_segment, el_segment));
+            new_plot_data.push((source.name2.clone(), az_segment, el_segment));
         }
     }
     new_plot_data
@@ -307,7 +308,8 @@ fn parse_drg_file<P: AsRef<Path>>(path: P) -> Result<DrgData, Box<dyn std::error
             ParseSection::Sources => {
                 let parts: Vec<&str> = trimmed_line.split_whitespace().collect();
                 if parts.len() >= 9 && parts[8] == "2000.0" {
-                    let name = parts[0].to_string();
+                    let name1 = parts[0].to_string();
+                    let name2 = parts[1].to_string();
                     let ra_h: f64 = parts[2].parse()?;
                     let ra_m: f64 = parts[3].parse()?;
                     let ra_s: f64 = parts[4].parse()?;
@@ -320,7 +322,7 @@ fn parse_drg_file<P: AsRef<Path>>(path: P) -> Result<DrgData, Box<dyn std::error
                     let dec_s: f64 = parts[7].parse()?;
                     let dec_deg = sign * (dec_d.abs() + dec_m / 60.0 + dec_s / 3600.0);
                     let dec_rad = dec_deg.to_radians();
-                    sources.push(Source { name, ra_rad, dec_rad });
+                    sources.push(Source { name1, name2, ra_rad, dec_rad });
                 }
             }
             ParseSection::Sked => {
