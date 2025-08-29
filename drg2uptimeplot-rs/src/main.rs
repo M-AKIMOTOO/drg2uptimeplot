@@ -1,14 +1,14 @@
-mod utils;
-
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use chrono::{Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{Duration, NaiveDate, NaiveDateTime, TimeZone, Utc, DateTime, Datelike, Timelike};
 use clap::Parser;
 use eframe::egui;
 use egui::{Color32, Stroke};
 use egui_plot::{GridMark, Legend, Line, Plot, PlotPoints, Corner, PlotBounds, Points};
+use astro::{coords, time, ecliptic, sun};
+use nav_types::{ECEF, WGS84};
 
 // --- Command Line Arguments Definition ---
 #[derive(Parser, Debug)]
@@ -67,8 +67,10 @@ struct DrgPlotApp {
 }
 
 impl DrgPlotApp {
-    fn new(station: Station, drg_data: DrgData, x_axis_bounds: [f64; 2], t0: NaiveDateTime) -> Self {
-        let plot_segments = calculate_observation_segments(&station, &drg_data.sources, &drg_data.schedule, t0);
+    fn new(station: Station, drg_data: DrgData, x_axis_bounds: [f64; 2], t0: NaiveDateTime, t_end: NaiveDateTime) -> Self {
+        let mut plot_segments = calculate_observation_segments(&station, &drg_data.sources, &drg_data.schedule, t0);
+        let sun_segment = calculate_sun_segments(&station, t0, t_end);
+        plot_segments.push(sun_segment);
         
         let mut color_map = HashMap::new();
         let palette = [
@@ -87,6 +89,7 @@ impl DrgPlotApp {
         for (i, name) in unique_sources.iter().enumerate() {
             color_map.insert(name.clone(), palette[i % palette.len()]);
         }
+        color_map.insert("Sun".to_string(), Color32::from_rgb(255, 255, 0)); // Yellow for Sun
 
         Self {
             plot_segments,
@@ -97,6 +100,7 @@ impl DrgPlotApp {
             reset_plot_bounds: false,
         }
     }
+        
 }
 
 impl eframe::App for DrgPlotApp {
@@ -246,7 +250,109 @@ impl DrgPlotApp {
     }
 }
 
+
+pub fn radec2azalt(ant_position: [f32; 3], time: DateTime<Utc>, obs_ra: f32, obs_dec: f32) -> (f32, f32, f32) {
+    let obs_year = time.year() as i16;
+    let obs_month = time.month() as u8;
+    let obs_day = time.day() as u8;
+    let obs_hour = time.hour() as u8;
+    let obs_minute = time.minute() as u8;
+    let obs_second = time.second() as f64; // + (time.nanosecond() as f64 / 1_000_000_000.0);
+
+    let decimal_day_calc = obs_day as f64 + obs_hour as f64 / 24.0 + obs_minute as f64 / 60.0 / 24.0 + obs_second as f64 / 24.0 / 60.0 / 60.0;
+
+    let date = time::Date {
+        year: obs_year,
+        month: obs_month,
+        decimal_day: decimal_day_calc,
+        cal_type: time::CalType::Gregorian,
+    };
+
+    let ecef_position = ECEF::new(ant_position[0] as f64, ant_position[1] as f64, ant_position[2] as f64);
+    let wgs84_position: WGS84<f64> = ecef_position.into();
+    let longitude_radian = wgs84_position.longitude_radians();
+    let latitude_radian = wgs84_position.latitude_radians();
+    let height_meter = wgs84_position.altitude();
+
+    let julian_day = time::julian_day(&date);
+    let mean_sidereal = time::mn_sidr(julian_day);
+    let hour_angle = coords::hr_angl_frm_observer_long(mean_sidereal, -longitude_radian, obs_ra as f64);
+
+    let source_az = coords::az_frm_eq(hour_angle, obs_dec as f64, latitude_radian).to_degrees() as f32 +180.0;
+    let source_el = coords::alt_frm_eq(hour_angle, obs_dec as f64, latitude_radian).to_degrees() as f32;
+
+    (source_az, source_el, height_meter as f32)
+}
+
 // --- Calculation Logic ---
+
+fn calculate_sun_segments(station: &Station, t0: NaiveDateTime, t_end: NaiveDateTime) -> (String, Vec<[f64; 2]>, Vec<[f64; 2]>) {
+    let mut az_segment = Vec::new();
+    let mut el_segment = Vec::new();
+    let ant_pos = station.pos;
+
+    let mut current_time = t0;
+    while current_time <= t_end {
+        let duration_since_t0 = current_time.signed_duration_since(t0);
+        let hour_float = duration_since_t0.num_seconds() as f64 / 3600.0;
+
+        let datetime_utc = Utc.from_utc_datetime(&current_time);
+        
+        let obs_year = datetime_utc.year() as i16;
+        let obs_month = datetime_utc.month() as u8;
+        let obs_day = datetime_utc.day() as u8;
+        let obs_hour = datetime_utc.hour() as u8;
+        let obs_minute = datetime_utc.minute() as u8;
+        let obs_second = datetime_utc.second() as f64;
+        let decimal_day_calc = obs_day as f64 + obs_hour as f64 / 24.0 + obs_minute as f64 / 60.0 / 24.0 + obs_second as f64 / 24.0 / 60.0 / 60.0;
+
+        let date = time::Date {
+            year: obs_year,
+            month: obs_month,
+            decimal_day: decimal_day_calc,
+            cal_type: time::CalType::Gregorian,
+        };
+        let jd = time::julian_day(&date);
+
+        // 1. Get Sun's ecliptic coordinates
+        let (ecl_point, _) = sun::geocent_ecl_pos(jd);
+        let ecl_lon = ecl_point.long;
+        let ecl_lat = ecl_point.lat;
+
+        // 2. Convert ecliptic to equatorial (RA/Dec)
+        let ra_rad = coords::asc_frm_ecl(ecl_lon, ecl_lat, ecliptic::mn_oblq_IAU(jd));
+        let dec_rad = coords::dec_frm_ecl(ecl_lon, ecl_lat, ecliptic::mn_oblq_IAU(jd));
+
+        // 3. Convert equatorial (RA/Dec) to Az/El
+        let mean_sidereal = time::mn_sidr(jd);
+        let geocentric_coord = ECEF::new(ant_pos[0] as f64, ant_pos[1] as f64, ant_pos[2] as f64);
+        let geodetic_coord: WGS84<f64> = geocentric_coord.into();
+        let longitude_radian = geodetic_coord.longitude_radians();
+        let latitude_radian = geodetic_coord.latitude_radians();
+        let hour_angle = coords::hr_angl_frm_observer_long(mean_sidereal, -longitude_radian, ra_rad);
+
+        let az = coords::az_frm_eq(hour_angle, dec_rad, latitude_radian).to_degrees() as f32 + 180.0;
+        let el = coords::alt_frm_eq(hour_angle, dec_rad, latitude_radian).to_degrees() as f32;
+
+        if el >= 0.0 {
+            az_segment.push([hour_float, az as f64]);
+            el_segment.push([hour_float, el as f64]);
+        } else {
+            az_segment.push([hour_float, az as f64]);
+            el_segment.push([hour_float, f64::NAN]);
+        }
+        current_time += Duration::minutes(5); // Calculate every 5 minutes
+    }
+
+    ("Sun".to_string(), az_segment, el_segment)
+}
+
+
+
+
+
+
+
 fn calculate_observation_segments(station: &Station, sources: &[Source], schedule: &[Observation], t0: NaiveDateTime) -> Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)> {
     let mut new_plot_data = Vec::new();
     let ant_pos = station.pos;
@@ -265,13 +371,13 @@ fn calculate_observation_segments(station: &Station, sources: &[Source], schedul
                 let hour_float = duration_since_t0.num_seconds() as f64 / 3600.0;
 
                 let datetime_utc = Utc.from_utc_datetime(&current_time);
-                let (az, el, _) = utils::radec2azalt(ant_pos, datetime_utc, source.ra_rad, source.dec_rad);
+                                let (az, el, _) = radec2azalt([ant_pos[0] as f32, ant_pos[1] as f32, ant_pos[2] as f32], datetime_utc, source.ra_rad as f32, source.dec_rad as f32);
 
                 if el >= 0.0 {
-                    az_segment.push([hour_float, az]);
-                    el_segment.push([hour_float, el]);
+                    az_segment.push([hour_float, az as f64]);
+                    el_segment.push([hour_float, el as f64]);
                 } else {
-                    az_segment.push([hour_float, az]);
+                    az_segment.push([hour_float, az as f64]);
                     el_segment.push([hour_float, f64::NAN]);
                 }
                 current_time += Duration::minutes(1);
@@ -308,8 +414,14 @@ fn parse_drg_file<P: AsRef<Path>>(path: P) -> Result<DrgData, Box<dyn std::error
             ParseSection::Sources => {
                 let parts: Vec<&str> = trimmed_line.split_whitespace().collect();
                 if parts.len() >= 9 && parts[8] == "2000.0" {
-                    let name1 = parts[0].to_string();
-                    let name2 = parts[1].to_string();
+                    let mut name1 = parts[0].to_string();
+                    let mut name2 = parts[1].to_string();
+                    if name1 == "$" { name1 = name2.clone(); }
+                    if name2 == "$" { name2 = name1.clone(); }
+                    if name1 == "$" && name2 == "$" { 
+                        name1 = "NanashinoGonbei".to_string(); 
+                        name2 = "NanashinoGonbei".to_string(); 
+                    }
                     let ra_h: f64 = parts[2].parse()?;
                     let ra_m: f64 = parts[3].parse()?;
                     let ra_s: f64 = parts[4].parse()?;
@@ -411,7 +523,7 @@ fn main() -> Result<(), eframe::Error> {
                 font_id.size *= 1.5;
             }
             cc.egui_ctx.set_style(style);
-            Ok(Box::new(DrgPlotApp::new(selected_station, drg_data, x_axis_bounds, t0)))
+            Ok(Box::new(DrgPlotApp::new(selected_station, drg_data, x_axis_bounds, t0, max_time)))
         }),
     )
 }
