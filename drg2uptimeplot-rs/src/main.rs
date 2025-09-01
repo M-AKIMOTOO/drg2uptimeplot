@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use chrono::{Duration, NaiveDate, NaiveDateTime, TimeZone, Utc, DateTime, Datelike, Timelike, Local};
+use chrono::{Duration, NaiveDate, NaiveDateTime, TimeZone, Utc, DateTime, Datelike, Timelike};
 use clap::Parser;
 use eframe::egui;
 use egui::{Color32, Stroke};
@@ -132,10 +132,8 @@ impl DrgPlotApp {
     fn ui_uptime_plot_tab(&mut self, ui: &mut egui::Ui) {
         let t0 = self.t0;
         let pointer_time_formatter = move |x: f64| -> String {
-            let time_utc = t0 + Duration::seconds((x * 3600.0).round() as i64);
-            let utc_datetime = Utc.from_utc_datetime(&time_utc);
-            let local_datetime = utc_datetime.with_timezone(&Local);
-            local_datetime.format("%m-%d %H:%M").to_string()
+            let time = t0 + Duration::seconds((x * 3600.0).round() as i64);                                              
+            time.format("%m-%d %H:%M").to_string()      
         };
 
         let az_pointer_formatter = |x: f64, y: f64| format!("Time: {:02}:{:02}\nAz: {:.1}°", x as u32, (x.fract() * 60.0) as u32, y);
