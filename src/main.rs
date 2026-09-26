@@ -3,11 +3,11 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, T
 use clap::Parser;
 use eframe::egui;
 use egui::{Color32, Stroke};
-use egui_plot::{Corner, GridMark, Legend, Line, Plot, PlotBounds, PlotPoints, Points};
+use egui_plot::{Corner, GridMark, Legend, Line, LineStyle, Plot, PlotBounds, PlotPoints, Points};
 use nav_types::{ECEF, WGS84};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 // --- Command Line Arguments Definition ---
@@ -24,6 +24,10 @@ struct Cli {
     /// Print the AZ/EL samples used by the GUI and exit
     #[arg(long)]
     terminal: bool,
+
+    /// Write full sky tracks with elevation >= 0 degrees
+    #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "DRG_azel.txt")]
+    output: Option<String>,
 }
 
 // --- Data Structures ---
@@ -57,11 +61,14 @@ struct DrgData {
 #[derive(PartialEq)]
 enum AppTab {
     UptimePlot,
+    UptimePlot2,
     PolarPlot,
 }
 
 // --- Plotting App ---
 struct DrgPlotApp {
+    sky_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
+    drg_ut_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
     plot_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
     color_map: HashMap<String, Color32>,
     x_axis_bounds: [f64; 2],
@@ -78,6 +85,10 @@ impl DrgPlotApp {
         t0: NaiveDateTime,
         t_end: NaiveDateTime,
     ) -> Self {
+        let sky_segments =
+            calculate_ut_sky_segments(&station, &drg_data.sources, &drg_data.schedule, t0, t_end);
+        let drg_ut_segments =
+            calculate_observation_segments_ut(&station, &drg_data.sources, &drg_data.schedule);
         let mut plot_segments =
             calculate_observation_segments(&station, &drg_data.sources, &drg_data.schedule, t0);
         let sun_segment = calculate_sun_segments(&station, t0, t_end);
@@ -107,6 +118,8 @@ impl DrgPlotApp {
         color_map.insert("Sun".to_string(), Color32::from_rgb(255, 255, 0)); // Yellow for Sun
 
         Self {
+            sky_segments,
+            drg_ut_segments,
             plot_segments,
             color_map,
             x_axis_bounds,
@@ -121,7 +134,8 @@ impl eframe::App for DrgPlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.selected_tab, AppTab::UptimePlot, "Uptime Plot");
+                ui.selectable_value(&mut self.selected_tab, AppTab::UptimePlot, "UptimePlot1");
+                ui.selectable_value(&mut self.selected_tab, AppTab::UptimePlot2, "UptimePlot2");
                 ui.selectable_value(&mut self.selected_tab, AppTab::PolarPlot, "Polar Plot");
 
                 ui.separator();
@@ -134,6 +148,7 @@ impl eframe::App for DrgPlotApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.selected_tab {
             AppTab::UptimePlot => self.ui_uptime_plot_tab(ui),
+            AppTab::UptimePlot2 => self.ui_uptime_plot2_tab(ui),
             AppTab::PolarPlot => self.ui_polar_plot_tab(ui),
         });
         self.reset_plot_bounds = false;
@@ -250,6 +265,171 @@ impl DrgPlotApp {
                 if let Some(color) = self.color_map.get(name) {
                     plot_ui.line(
                         Line::new(name.clone(), PlotPoints::from(el_points.clone())).color(*color),
+                    );
+                }
+            }
+        });
+    }
+
+    fn ui_uptime_plot2_tab(&mut self, ui: &mut egui::Ui) {
+        let pointer_time_formatter = |x: f64| -> String {
+            let total_minutes = (x * 60.0).round() as i64;
+            format!("{:02}:{:02}", total_minutes / 60, total_minutes % 60)
+        };
+
+        let az_pointer_formatter = |x: f64, y: f64| {
+            format!(
+                "Time: {:02}:{:02}\nAz: {:.1}°",
+                x as u32,
+                (x.fract() * 60.0) as u32,
+                y
+            )
+        };
+        let el_pointer_formatter = |x: f64, y: f64| {
+            format!(
+                "Time: {:02}:{:02}\nEl: {:.1}°",
+                x as u32,
+                (x.fract() * 60.0) as u32,
+                y
+            )
+        };
+
+        let plot_az = Plot::new("az_plot2")
+            .width(ui.available_width())
+            .include_x(0.0)
+            .include_x(24.0)
+            .height(ui.available_height() / 2.0)
+            .y_axis_label("Azimuth (deg)")
+            .y_axis_min_width(70.0)
+            .allow_drag(true)
+            .allow_zoom(true)
+            .allow_scroll(true)
+            .include_y(0.0)
+            .include_y(360.0)
+            .y_grid_spacer(|_input| {
+                (0..=12)
+                    .map(|v| GridMark {
+                        value: (v * 30) as f64,
+                        step_size: 30.0,
+                    })
+                    .collect()
+            })
+            .show_x(true)
+            .x_axis_label("")
+            .x_axis_formatter(|_, _| "".to_string())
+            .y_axis_formatter(|m, _| format!("{:>3}", m.value as i32))
+            .show_y(true)
+            .coordinates_formatter(
+                Corner::LeftTop,
+                egui_plot::CoordinatesFormatter::new(move |p, _| az_pointer_formatter(p.x, p.y)),
+            )
+            .legend(Legend::default());
+
+        let plot_el = Plot::new("el_plot2")
+            .width(ui.available_width())
+            .include_x(0.0)
+            .include_x(24.0)
+            .height(ui.available_height() / 2.0)
+            .y_axis_label("Elevation (deg)")
+            .y_axis_min_width(70.0)
+            .allow_drag(true)
+            .allow_zoom(true)
+            .allow_scroll(true)
+            .include_y(0.0)
+            .include_y(90.0)
+            .x_axis_label("UTC time")
+            .x_axis_formatter(move |m, _| pointer_time_formatter(m.value))
+            .y_axis_formatter(|m, _| format!("{:>2}", m.value as i32))
+            .show_y(true)
+            .y_grid_spacer(|_input| {
+                (0..=9)
+                    .map(|v| GridMark {
+                        value: (v * 10) as f64,
+                        step_size: 10.0,
+                    })
+                    .collect()
+            })
+            .coordinates_formatter(
+                Corner::LeftTop,
+                egui_plot::CoordinatesFormatter::new(move |p, _| el_pointer_formatter(p.x, p.y)),
+            )
+            .legend(Legend::default());
+
+        plot_az.show(ui, |plot_ui| {
+            if self.reset_plot_bounds {
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max([0.0, 0.0], [24.0, 360.0]));
+            }
+
+            for (name, az_points, _) in &self.sky_segments {
+                if let Some(color) = self.color_map.get(name) {
+                    plot_ui.line(
+                        Line::new(
+                            format!("{} (sky)", name),
+                            PlotPoints::from(az_points.clone()),
+                        )
+                        .color(*color)
+                        .width(1.0)
+                        .style(LineStyle::dotted_dense()),
+                    );
+                }
+            }
+
+            let mut seen_drg_targets = HashSet::new();
+            for (name, az_points, _) in &self.drg_ut_segments {
+                if name == "Sun" {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    let label = if seen_drg_targets.insert(name.clone()) {
+                        format!("{} (DRG)", name)
+                    } else {
+                        String::new()
+                    };
+                    plot_ui.line(
+                        Line::new(label, PlotPoints::from(az_points.clone()))
+                            .color(*color)
+                            .width(3.0),
+                    );
+                }
+            }
+        });
+
+        ui.add_space(-10.0);
+
+        plot_el.show(ui, |plot_ui| {
+            if self.reset_plot_bounds {
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max([0.0, 0.0], [24.0, 90.0]));
+            }
+
+            for (name, _, el_points) in &self.sky_segments {
+                if let Some(color) = self.color_map.get(name) {
+                    plot_ui.line(
+                        Line::new(
+                            format!("{} (sky)", name),
+                            PlotPoints::from(el_points.clone()),
+                        )
+                        .color(*color)
+                        .width(1.0)
+                        .style(LineStyle::dotted_dense()),
+                    );
+                }
+            }
+
+            let mut seen_drg_targets = HashSet::new();
+            for (name, _, el_points) in &self.drg_ut_segments {
+                if name == "Sun" {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    let label = if seen_drg_targets.insert(name.clone()) {
+                        format!("{} (DRG)", name)
+                    } else {
+                        String::new()
+                    };
+                    plot_ui.line(
+                        Line::new(label, PlotPoints::from(el_points.clone()))
+                            .color(*color)
+                            .width(3.0),
                     );
                 }
             }
@@ -470,6 +650,123 @@ fn calculate_sun_segments(
     ("Sun".to_string(), az_segment, el_segment)
 }
 
+fn calculate_sky_segments(
+    station: &Station,
+    sources: &[Source],
+    schedule: &[Observation],
+    t0: NaiveDateTime,
+    t_end: NaiveDateTime,
+) -> Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)> {
+    let mut sky_segments = Vec::new();
+    let mut seen_sources = HashSet::new();
+    let scheduled_sources = schedule
+        .iter()
+        .map(|observation| observation.source_name.as_str())
+        .collect::<HashSet<_>>();
+
+    for source in sources {
+        if !scheduled_sources.contains(source.name1.as_str())
+            && !scheduled_sources.contains(source.name2.as_str())
+        {
+            continue;
+        }
+        if !seen_sources.insert(source.name2.clone()) {
+            continue;
+        }
+
+        let mut az_segment = Vec::new();
+        let mut el_segment = Vec::new();
+        let mut current_time = t0;
+
+        while current_time <= t_end {
+            let duration_since_t0 = current_time.signed_duration_since(t0);
+            let hour_float = duration_since_t0.num_seconds() as f64 / 3600.0;
+            let datetime_utc = Utc.from_utc_datetime(&current_time);
+            let (az, el, _) = radec2azalt(
+                [
+                    station.pos[0] as f32,
+                    station.pos[1] as f32,
+                    station.pos[2] as f32,
+                ],
+                datetime_utc,
+                source.ra_rad as f32,
+                source.dec_rad as f32,
+            );
+
+            az_segment.push([hour_float, az as f64]);
+            el_segment.push([hour_float, if el >= 0.0 { el as f64 } else { f64::NAN }]);
+            current_time += Duration::minutes(1);
+        }
+
+        sky_segments.push((source.name2.clone(), az_segment, el_segment));
+    }
+
+    sky_segments.push(calculate_sun_segments(station, t0, t_end));
+    sky_segments
+}
+
+fn utc_hour(time: NaiveDateTime) -> f64 {
+    time.hour() as f64 + time.minute() as f64 / 60.0 + time.second() as f64 / 3600.0
+}
+
+fn convert_segments_to_ut_axis(
+    base_time: NaiveDateTime,
+    segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
+) -> Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)> {
+    segments
+        .into_iter()
+        .map(|(name, az_points, el_points)| {
+            let mut ut_az_points = Vec::new();
+            let mut ut_el_points = Vec::new();
+            let mut previous_date = None;
+
+            for (az_point, el_point) in az_points.iter().zip(el_points.iter()) {
+                let sample_time =
+                    base_time + Duration::seconds((az_point[0] * 3600.0).round() as i64);
+                if previous_date.is_some() && previous_date != Some(sample_time.date()) {
+                    ut_az_points.push([0.0, f64::NAN]);
+                    ut_el_points.push([0.0, f64::NAN]);
+                }
+                ut_az_points.push([utc_hour(sample_time), az_point[1]]);
+                ut_el_points.push([utc_hour(sample_time), el_point[1]]);
+                previous_date = Some(sample_time.date());
+            }
+
+            (name, ut_az_points, ut_el_points)
+        })
+        .collect()
+}
+
+fn calculate_ut_sky_segments(
+    station: &Station,
+    sources: &[Source],
+    schedule: &[Observation],
+    t0: NaiveDateTime,
+    t_end: NaiveDateTime,
+) -> Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)> {
+    let first_day_start = t0.date().and_hms_opt(0, 0, 0).unwrap();
+    let last_day_end = t_end.date().and_hms_opt(23, 59, 0).unwrap();
+    let segments =
+        calculate_sky_segments(station, sources, schedule, first_day_start, last_day_end);
+    convert_segments_to_ut_axis(first_day_start, segments)
+}
+
+fn calculate_observation_segments_ut(
+    station: &Station,
+    sources: &[Source],
+    schedule: &[Observation],
+) -> Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)> {
+    let t0 = schedule
+        .iter()
+        .map(|observation| observation.start_time)
+        .min()
+        .unwrap();
+    convert_segments_to_ut_axis(
+        t0,
+        calculate_observation_segments(station, sources, schedule, t0),
+    )
+}
+
 fn calculate_observation_segments(
     station: &Station,
     sources: &[Source],
@@ -516,6 +813,50 @@ fn calculate_observation_segments(
         }
     }
     new_plot_data
+}
+
+fn write_full_track_file<P: AsRef<Path>>(
+    path: P,
+    station: &Station,
+    sources: &[Source],
+    schedule: &[Observation],
+    t0: NaiveDateTime,
+    t_end: NaiveDateTime,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let sky_segments = calculate_sky_segments(station, sources, schedule, t0, t_end);
+    let mut file = File::create(path)?;
+    writeln!(file, "# Full sky track (EL >= 0 deg)")?;
+    writeln!(file, "# start: {}", t0.format("%Y-%m-%d %H:%M:%S"))?;
+    writeln!(file, "# end:   {}", t_end.format("%Y-%m-%d %H:%M:%S"))?;
+    writeln!(
+        file,
+        "{:<16} {:19} {:>8} {:>8}",
+        "target", "time", "AZ", "EL"
+    )?;
+
+    let mut row_count = 0;
+    for (name, az_points, el_points) in sky_segments {
+        for (az_point, el_point) in az_points.iter().zip(el_points.iter()) {
+            let el = el_point[1];
+            if !el.is_finite() || el < 0.0 {
+                continue;
+            }
+
+            let sample_time = t0 + Duration::seconds((az_point[0] * 3600.0).round() as i64);
+            writeln!(
+                file,
+                "{:<16} {} {:>8.2} {:>8.2}",
+                name,
+                sample_time.format("%Y-%m-%d %H:%M:%S"),
+                az_point[1],
+                el
+            )?;
+            row_count += 1;
+        }
+        writeln!(file)?;
+    }
+
+    Ok(row_count)
 }
 
 fn print_terminal_observation_data(
@@ -733,11 +1074,6 @@ fn main() -> Result<(), eframe::Error> {
         std::process::exit(1);
     }
 
-    if cli.terminal {
-        print_terminal_observation_data(&selected_station, &drg_data.sources, &drg_data.schedule);
-        return Ok(());
-    }
-
     let t0 = drg_data
         .schedule
         .iter()
@@ -750,6 +1086,28 @@ fn main() -> Result<(), eframe::Error> {
         .map(|obs| obs.start_time + Duration::seconds(obs.duration_sec))
         .max()
         .unwrap();
+
+    if let Some(output_path) = cli.output.as_deref() {
+        match write_full_track_file(
+            output_path,
+            &selected_station,
+            &drg_data.sources,
+            &drg_data.schedule,
+            t0,
+            max_time,
+        ) {
+            Ok(row_count) => eprintln!("Wrote {} full-track rows to {}", row_count, output_path),
+            Err(e) => {
+                eprintln!("Error writing {}: {}", output_path, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if cli.terminal {
+        print_terminal_observation_data(&selected_station, &drg_data.sources, &drg_data.schedule);
+        return Ok(());
+    }
 
     let min_x = 0.0;
     let max_x = (max_time - t0).num_seconds() as f64 / 3600.0;
