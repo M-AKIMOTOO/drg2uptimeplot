@@ -3,7 +3,7 @@ use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, TimeZone, T
 use clap::Parser;
 use eframe::egui;
 use egui::{Color32, Stroke};
-use egui_plot::{Corner, GridMark, Legend, Line, LineStyle, Plot, PlotBounds, PlotPoints, Points};
+use egui_plot::{Corner, GridMark, Line, LineStyle, Plot, PlotBounds, PlotPoints, Points};
 use nav_types::{ECEF, WGS84};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -58,7 +58,7 @@ struct DrgData {
     schedule: Vec<Observation>,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum AppTab {
     UptimePlot,
     UptimePlot2,
@@ -76,6 +76,7 @@ struct DrgPlotApp {
     t0: NaiveDateTime,
     selected_tab: AppTab,
     reset_plot_bounds: bool,
+    hidden_targets: HashMap<AppTab, HashSet<String>>,
 }
 
 impl DrgPlotApp {
@@ -127,6 +128,7 @@ impl DrgPlotApp {
             t0,
             selected_tab: AppTab::UptimePlot,
             reset_plot_bounds: false,
+            hidden_targets: HashMap::new(),
         }
     }
 }
@@ -148,6 +150,11 @@ impl eframe::App for DrgPlotApp {
             });
         });
 
+        egui::SidePanel::right("target_legend_panel")
+            .default_width(190.0)
+            .resizable(true)
+            .show(ctx, |ui| self.ui_target_legend(ui));
+
         egui::CentralPanel::default().show(ctx, |ui| match self.selected_tab {
             AppTab::UptimePlot => self.ui_uptime_plot_tab(ui),
             AppTab::UptimePlot2 => self.ui_uptime_plot2_tab(ui),
@@ -159,6 +166,67 @@ impl eframe::App for DrgPlotApp {
 }
 
 impl DrgPlotApp {
+    fn target_legend_entries(&self) -> Vec<(String, Color32)> {
+        let mut names = Vec::new();
+        match &self.selected_tab {
+            AppTab::UptimePlot | AppTab::PolarPlot1 => {
+                names.extend(self.plot_segments.iter().map(|(name, _, _)| name.clone()));
+            }
+            AppTab::UptimePlot2 | AppTab::PolarPlot2 => {
+                names.extend(self.sky_segments.iter().map(|(name, _, _)| name.clone()));
+                names.extend(
+                    self.drg_ut_segments
+                        .iter()
+                        .filter(|(name, _, _)| name != "Sun")
+                        .map(|(name, _, _)| name.clone()),
+                );
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .filter_map(|name| self.color_map.get(&name).map(|color| (name, *color)))
+            .collect()
+    }
+
+    fn ui_target_legend(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Targets");
+        if self.selected_tab == AppTab::UptimePlot2 || self.selected_tab == AppTab::PolarPlot2 {
+            ui.small("Dotted: sky   Solid: DRG");
+        }
+        ui.separator();
+
+        let entries = self.target_legend_entries();
+        let hidden_targets = self.hidden_targets.entry(self.selected_tab).or_default();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (name, color) in entries {
+                    let mut visible = !hidden_targets.contains(&name);
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut visible, "").changed() {
+                            if visible {
+                                hidden_targets.remove(&name);
+                            } else {
+                                hidden_targets.insert(name.clone());
+                            }
+                        }
+                        let (swatch, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().rect_filled(swatch, 2.0, color);
+                        ui.label(name);
+                    });
+                }
+            });
+    }
+
+    fn target_is_hidden(&self, name: &str) -> bool {
+        self.hidden_targets
+            .get(&self.selected_tab)
+            .is_some_and(|targets| targets.contains(name))
+    }
+
     fn ui_uptime_plot_tab(&mut self, ui: &mut egui::Ui) {
         let t0 = self.t0;
         let pointer_time_formatter = move |x: f64| -> String {
@@ -209,8 +277,7 @@ impl DrgPlotApp {
             .coordinates_formatter(
                 Corner::LeftTop,
                 egui_plot::CoordinatesFormatter::new(move |p, _| az_pointer_formatter(p.x, p.y)),
-            )
-            .legend(Legend::default());
+            );
 
         let plot_el = Plot::new("el_plot")
             .width(ui.available_width())
@@ -236,8 +303,7 @@ impl DrgPlotApp {
             .coordinates_formatter(
                 Corner::LeftTop,
                 egui_plot::CoordinatesFormatter::new(move |p, _| el_pointer_formatter(p.x, p.y)),
-            )
-            .legend(Legend::default());
+            );
 
         plot_az.show(ui, |plot_ui| {
             if self.reset_plot_bounds {
@@ -247,10 +313,14 @@ impl DrgPlotApp {
                 ));
             }
             for (name, az_points, _) in &self.plot_segments {
+                if self.target_is_hidden(name) {
+                    continue;
+                }
                 if let Some(color) = self.color_map.get(name) {
-                    plot_ui.line(
-                        Line::new(name.clone(), PlotPoints::from(az_points.clone())).color(*color),
-                    );
+                    for points in split_finite_segments(az_points) {
+                        plot_ui
+                            .line(Line::new(name.clone(), PlotPoints::from(points)).color(*color));
+                    }
                 }
             }
         });
@@ -265,10 +335,14 @@ impl DrgPlotApp {
                 ));
             }
             for (name, _, el_points) in &self.plot_segments {
+                if self.target_is_hidden(name) {
+                    continue;
+                }
                 if let Some(color) = self.color_map.get(name) {
-                    plot_ui.line(
-                        Line::new(name.clone(), PlotPoints::from(el_points.clone())).color(*color),
-                    );
+                    for points in split_finite_segments(el_points) {
+                        plot_ui
+                            .line(Line::new(name.clone(), PlotPoints::from(points)).color(*color));
+                    }
                 }
             }
         });
@@ -324,8 +398,7 @@ impl DrgPlotApp {
             .coordinates_formatter(
                 Corner::LeftTop,
                 egui_plot::CoordinatesFormatter::new(move |p, _| az_pointer_formatter(p.x, p.y)),
-            )
-            .legend(Legend::default());
+            );
 
         let plot_el = Plot::new("el_plot_ut24")
             .width(ui.available_width())
@@ -336,9 +409,9 @@ impl DrgPlotApp {
             .allow_drag(true)
             .allow_zoom(true)
             .allow_scroll(true)
-            .default_y_bounds(0.0, 90.0)
             .include_y(0.0)
             .include_y(90.0)
+            .set_margin_fraction(egui::Vec2::ZERO)
             .x_axis_label("UTC time")
             .x_axis_formatter(move |m, _| pointer_time_formatter(m.value))
             .y_axis_formatter(|m, _| format!("{:>2}", m.value as i32))
@@ -354,8 +427,7 @@ impl DrgPlotApp {
             .coordinates_formatter(
                 Corner::LeftTop,
                 egui_plot::CoordinatesFormatter::new(move |p, _| el_pointer_formatter(p.x, p.y)),
-            )
-            .legend(Legend::default());
+            );
 
         plot_az.show(ui, |plot_ui| {
             if self.reset_plot_bounds {
@@ -363,35 +435,33 @@ impl DrgPlotApp {
             }
 
             for (name, az_points, _) in &self.sky_segments {
-                if let Some(color) = self.color_map.get(name) {
-                    plot_ui.line(
-                        Line::new(
-                            format!("{} (sky)", name),
-                            PlotPoints::from(az_points.clone()),
-                        )
-                        .color(*color)
-                        .width(1.0)
-                        .style(LineStyle::dotted_dense()),
-                    );
-                }
-            }
-
-            let mut seen_drg_targets = HashSet::new();
-            for (name, az_points, _) in &self.drg_ut_segments {
-                if name == "Sun" {
+                if self.target_is_hidden(name) {
                     continue;
                 }
                 if let Some(color) = self.color_map.get(name) {
-                    let label = if seen_drg_targets.insert(name.clone()) {
-                        format!("{} (DRG)", name)
-                    } else {
-                        String::new()
-                    };
-                    plot_ui.line(
-                        Line::new(label, PlotPoints::from(az_points.clone()))
-                            .color(*color)
-                            .width(3.0),
-                    );
+                    for points in split_finite_segments(az_points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (sky)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(1.0)
+                                .style(LineStyle::dotted_dense()),
+                        );
+                    }
+                }
+            }
+
+            for (name, az_points, _) in &self.drg_ut_segments {
+                if name == "Sun" || self.target_is_hidden(name) {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    for points in split_finite_segments(az_points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (DRG)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(3.0),
+                        );
+                    }
                 }
             }
         });
@@ -404,45 +474,35 @@ impl DrgPlotApp {
             }
 
             for (name, _, el_points) in &self.sky_segments {
-                if let Some(color) = self.color_map.get(name) {
-                    let above_horizon = el_points
-                        .iter()
-                        .copied()
-                        .filter(|point| point[1] > 0.0)
-                        .collect::<Vec<_>>();
-                    plot_ui.line(
-                        Line::new(
-                            format!("{} (sky)", name),
-                            PlotPoints::from(above_horizon),
-                        )
-                        .color(*color)
-                        .width(1.0)
-                        .style(LineStyle::dotted_dense()),
-                    );
-                }
-            }
-
-            let mut seen_drg_targets = HashSet::new();
-            for (name, _, el_points) in &self.drg_ut_segments {
-                if name == "Sun" {
+                if self.target_is_hidden(name) {
                     continue;
                 }
                 if let Some(color) = self.color_map.get(name) {
-                    let label = if seen_drg_targets.insert(name.clone()) {
-                        format!("{} (DRG)", name)
-                    } else {
-                        String::new()
-                    };
-                    let above_horizon = el_points
-                        .iter()
-                        .copied()
-                        .filter(|point| point[1] > 0.0)
-                        .collect::<Vec<_>>();
-                    plot_ui.line(
-                        Line::new(label, PlotPoints::from(above_horizon))
-                            .color(*color)
-                            .width(3.0),
-                    );
+                    let visible_points = filter_elevation_points(el_points, 5.0);
+                    for points in split_finite_segments(&visible_points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (sky)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(1.0)
+                                .style(LineStyle::dotted_dense()),
+                        );
+                    }
+                }
+            }
+
+            for (name, _, el_points) in &self.drg_ut_segments {
+                if name == "Sun" || self.target_is_hidden(name) {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    let visible_points = filter_elevation_points(el_points, 5.0);
+                    for points in split_finite_segments(&visible_points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (DRG)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(3.0),
+                        );
+                    }
                 }
             }
         });
@@ -466,8 +526,7 @@ impl DrgPlotApp {
             .y_grid_spacer(|_input| vec![])
             .allow_drag(true)
             .allow_zoom(true)
-            .allow_scroll(true) // Added for interactivity
-            .legend(Legend::default());
+            .allow_scroll(true); // Added for interactivity
 
         plot.show(ui, |plot_ui| {
             if self.reset_plot_bounds {
@@ -476,6 +535,9 @@ impl DrgPlotApp {
             draw_polar_grid(plot_ui, 0.0);
 
             for (name, az_points, el_points) in &self.plot_segments {
+                if self.target_is_hidden(name) {
+                    continue;
+                }
                 let mut polar_points = Vec::new();
                 for i in 0..az_points.len() {
                     let az = az_points[i][1];
@@ -515,8 +577,7 @@ impl DrgPlotApp {
             .y_grid_spacer(|_input| vec![])
             .allow_drag(true)
             .allow_zoom(true)
-            .allow_scroll(true)
-            .legend(Legend::default());
+            .allow_scroll(true);
 
         plot.show(ui, |plot_ui| {
             if self.reset_plot_bounds {
@@ -525,34 +586,35 @@ impl DrgPlotApp {
             draw_polar_grid(plot_ui, 0.0);
 
             for (name, az_points, el_points) in &self.sky_segments {
-                if let Some(color) = self.color_map.get(name) {
-                    let points = azel_to_polar_points(az_points, el_points);
-                    plot_ui.line(
-                        Line::new(format!("{} (sky)", name), PlotPoints::from(points))
-                            .color(*color)
-                            .width(1.0)
-                            .style(LineStyle::dotted_dense()),
-                    );
-                }
-            }
-
-            let mut seen_drg_targets = HashSet::new();
-            for (name, az_points, el_points) in &self.drg_ut_segments {
-                if name == "Sun" {
+                if self.target_is_hidden(name) {
                     continue;
                 }
                 if let Some(color) = self.color_map.get(name) {
-                    let label = if seen_drg_targets.insert(name.clone()) {
-                        format!("{} (DRG)", name)
-                    } else {
-                        String::new()
-                    };
                     let points = azel_to_polar_points(az_points, el_points);
-                    plot_ui.line(
-                        Line::new(label, PlotPoints::from(points))
-                            .color(*color)
-                            .width(3.0),
-                    );
+                    for points in split_finite_segments(&points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (sky)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(1.0)
+                                .style(LineStyle::dotted_dense()),
+                        );
+                    }
+                }
+            }
+
+            for (name, az_points, el_points) in &self.drg_ut_segments {
+                if name == "Sun" || self.target_is_hidden(name) {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    let points = azel_to_polar_points(az_points, el_points);
+                    for points in split_finite_segments(&points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (DRG)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(3.0),
+                        );
+                    }
                 }
             }
         });
@@ -619,7 +681,7 @@ fn azel_to_polar_points(az_points: &[[f64; 2]], el_points: &[[f64; 2]]) -> Vec<[
         .map(|(az_point, el_point)| {
             let azimuth = az_point[1];
             let elevation = el_point[1];
-            if !azimuth.is_finite() || !elevation.is_finite() || elevation <= 0.0 {
+            if !azimuth.is_finite() || !elevation.is_finite() || elevation < 5.0 {
                 return [f64::NAN, f64::NAN];
             }
             let angle = (90.0 - azimuth).to_radians();
@@ -627,6 +689,37 @@ fn azel_to_polar_points(az_points: &[[f64; 2]], el_points: &[[f64; 2]]) -> Vec<[
             [radius * angle.cos(), radius * angle.sin()]
         })
         .collect()
+}
+
+fn filter_elevation_points(points: &[[f64; 2]], minimum_elevation: f64) -> Vec<[f64; 2]> {
+    points
+        .iter()
+        .map(|point| {
+            if point[1].is_finite() && point[1] >= minimum_elevation {
+                *point
+            } else {
+                [point[0], f64::NAN]
+            }
+        })
+        .collect()
+}
+
+fn split_finite_segments(points: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
+    let mut segments = Vec::new();
+    let mut current = Vec::new();
+
+    for &point in points {
+        if point[0].is_finite() && point[1].is_finite() {
+            current.push(point);
+        } else if !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 pub fn radec2azalt(
