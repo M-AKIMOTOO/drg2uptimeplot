@@ -11,4 +11,10 @@ egui_plot = "0.33.0"
 astro = "2.0.0"
 
 nav-types     = "0.5"
-plotters = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

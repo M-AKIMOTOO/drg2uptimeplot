@@ -62,7 +62,8 @@ struct DrgData {
 enum AppTab {
     UptimePlot,
     UptimePlot2,
-    PolarPlot,
+    PolarPlot1,
+    PolarPlot2,
 }
 
 // --- Plotting App ---
@@ -91,7 +92,7 @@ impl DrgPlotApp {
             calculate_observation_segments_ut(&station, &drg_data.sources, &drg_data.schedule);
         let mut plot_segments =
             calculate_observation_segments(&station, &drg_data.sources, &drg_data.schedule, t0);
-        let sun_segment = calculate_sun_segments(&station, t0, t_end);
+        let sun_segment = calculate_sun_segments(&station, t0, t_end, false);
         plot_segments.push(sun_segment);
 
         let mut color_map = HashMap::new();
@@ -136,7 +137,8 @@ impl eframe::App for DrgPlotApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.selected_tab, AppTab::UptimePlot, "UptimePlot1");
                 ui.selectable_value(&mut self.selected_tab, AppTab::UptimePlot2, "UptimePlot2");
-                ui.selectable_value(&mut self.selected_tab, AppTab::PolarPlot, "Polar Plot");
+                ui.selectable_value(&mut self.selected_tab, AppTab::PolarPlot1, "PolarPlot1");
+                ui.selectable_value(&mut self.selected_tab, AppTab::PolarPlot2, "PolarPlot2");
 
                 ui.separator();
 
@@ -149,7 +151,8 @@ impl eframe::App for DrgPlotApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.selected_tab {
             AppTab::UptimePlot => self.ui_uptime_plot_tab(ui),
             AppTab::UptimePlot2 => self.ui_uptime_plot2_tab(ui),
-            AppTab::PolarPlot => self.ui_polar_plot_tab(ui),
+            AppTab::PolarPlot1 => self.ui_polar_plot1_tab(ui),
+            AppTab::PolarPlot2 => self.ui_polar_plot2_tab(ui),
         });
         self.reset_plot_bounds = false;
     }
@@ -294,10 +297,9 @@ impl DrgPlotApp {
             )
         };
 
-        let plot_az = Plot::new("az_plot2")
+        let plot_az = Plot::new("az_plot_ut24")
             .width(ui.available_width())
-            .include_x(0.0)
-            .include_x(24.0)
+            .default_x_bounds(0.0, 24.0)
             .height(ui.available_height() / 2.0)
             .y_axis_label("Azimuth (deg)")
             .y_axis_min_width(70.0)
@@ -325,16 +327,16 @@ impl DrgPlotApp {
             )
             .legend(Legend::default());
 
-        let plot_el = Plot::new("el_plot2")
+        let plot_el = Plot::new("el_plot_ut24")
             .width(ui.available_width())
-            .include_x(0.0)
-            .include_x(24.0)
+            .default_x_bounds(0.0, 24.0)
             .height(ui.available_height() / 2.0)
             .y_axis_label("Elevation (deg)")
             .y_axis_min_width(70.0)
             .allow_drag(true)
             .allow_zoom(true)
             .allow_scroll(true)
+            .default_y_bounds(0.0, 90.0)
             .include_y(0.0)
             .include_y(90.0)
             .x_axis_label("UTC time")
@@ -403,10 +405,15 @@ impl DrgPlotApp {
 
             for (name, _, el_points) in &self.sky_segments {
                 if let Some(color) = self.color_map.get(name) {
+                    let above_horizon = el_points
+                        .iter()
+                        .copied()
+                        .filter(|point| point[1] > 0.0)
+                        .collect::<Vec<_>>();
                     plot_ui.line(
                         Line::new(
                             format!("{} (sky)", name),
-                            PlotPoints::from(el_points.clone()),
+                            PlotPoints::from(above_horizon),
                         )
                         .color(*color)
                         .width(1.0)
@@ -426,8 +433,13 @@ impl DrgPlotApp {
                     } else {
                         String::new()
                     };
+                    let above_horizon = el_points
+                        .iter()
+                        .copied()
+                        .filter(|point| point[1] > 0.0)
+                        .collect::<Vec<_>>();
                     plot_ui.line(
-                        Line::new(label, PlotPoints::from(el_points.clone()))
+                        Line::new(label, PlotPoints::from(above_horizon))
                             .color(*color)
                             .width(3.0),
                     );
@@ -436,7 +448,7 @@ impl DrgPlotApp {
         });
     }
 
-    fn ui_polar_plot_tab(&mut self, ui: &mut egui::Ui) {
+    fn ui_polar_plot1_tab(&mut self, ui: &mut egui::Ui) {
         let plot = Plot::new("polar_plot")
             .width(ui.available_width())
             .height(ui.available_height())
@@ -461,51 +473,7 @@ impl DrgPlotApp {
             if self.reset_plot_bounds {
                 plot_ui.set_plot_bounds(PlotBounds::from_min_max([-1.0, -1.0], [1.0, 1.0]));
             }
-            for el_level in [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0] {
-                let radius = (90.0 - el_level) / 90.0;
-                if radius >= 0.0 {
-                    let circle_points: PlotPoints = (0..=100)
-                        .map(|i| {
-                            let angle = i as f64 * 2.0 * std::f64::consts::PI / 100.0;
-                            [radius * angle.cos(), radius * angle.sin()]
-                        })
-                        .collect();
-                    plot_ui.line(
-                        Line::new("", circle_points).stroke(Stroke::new(1.0, Color32::DARK_GRAY)),
-                    );
-                    if el_level != 90.0 {
-                        let label_text = format!("{:.0}°", el_level);
-                        let label_x = radius * (72.0f64).to_radians().cos();
-                        let label_y = radius * (72.0f64).to_radians().sin();
-                        plot_ui.text(
-                            egui_plot::Text::new(
-                                "",
-                                egui_plot::PlotPoint::new(label_x, label_y),
-                                label_text,
-                            )
-                            .color(Color32::DARK_GRAY),
-                        );
-                    }
-                }
-            }
-
-            for az_level in [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
-                let angle_rad = (90.0f64 - az_level).to_radians();
-                let line_points = vec![[0.0, 0.0], [angle_rad.cos(), angle_rad.sin()]];
-                plot_ui.line(
-                    Line::new("", PlotPoints::from(line_points))
-                        .stroke(Stroke::new(1.0, Color32::DARK_GRAY)),
-                );
-                let label_text = format!("{:.0}°", az_level);
-                plot_ui.text(
-                    egui_plot::Text::new(
-                        "",
-                        egui_plot::PlotPoint::new(angle_rad.cos() * 1.1, angle_rad.sin() * 1.1),
-                        label_text,
-                    )
-                    .color(Color32::DARK_GRAY),
-                );
-            }
+            draw_polar_grid(plot_ui, 0.0);
 
             for (name, az_points, el_points) in &self.plot_segments {
                 let mut polar_points = Vec::new();
@@ -528,6 +496,137 @@ impl DrgPlotApp {
             }
         });
     }
+
+    fn ui_polar_plot2_tab(&mut self, ui: &mut egui::Ui) {
+        let plot = Plot::new("polar_plot2")
+            .width(ui.available_width())
+            .height(ui.available_height())
+            .data_aspect(1.0)
+            .view_aspect(1.0)
+            .include_x(-1.0)
+            .include_x(1.0)
+            .include_y(-1.0)
+            .include_y(1.0)
+            .center_x_axis(true)
+            .center_y_axis(true)
+            .show_x(false)
+            .show_y(false)
+            .x_grid_spacer(|_input| vec![])
+            .y_grid_spacer(|_input| vec![])
+            .allow_drag(true)
+            .allow_zoom(true)
+            .allow_scroll(true)
+            .legend(Legend::default());
+
+        plot.show(ui, |plot_ui| {
+            if self.reset_plot_bounds {
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max([-1.0, -1.0], [1.0, 1.0]));
+            }
+            draw_polar_grid(plot_ui, 0.0);
+
+            for (name, az_points, el_points) in &self.sky_segments {
+                if let Some(color) = self.color_map.get(name) {
+                    let points = azel_to_polar_points(az_points, el_points);
+                    plot_ui.line(
+                        Line::new(format!("{} (sky)", name), PlotPoints::from(points))
+                            .color(*color)
+                            .width(1.0)
+                            .style(LineStyle::dotted_dense()),
+                    );
+                }
+            }
+
+            let mut seen_drg_targets = HashSet::new();
+            for (name, az_points, el_points) in &self.drg_ut_segments {
+                if name == "Sun" {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    let label = if seen_drg_targets.insert(name.clone()) {
+                        format!("{} (DRG)", name)
+                    } else {
+                        String::new()
+                    };
+                    let points = azel_to_polar_points(az_points, el_points);
+                    plot_ui.line(
+                        Line::new(label, PlotPoints::from(points))
+                            .color(*color)
+                            .width(3.0),
+                    );
+                }
+            }
+        });
+    }
+}
+
+fn draw_polar_grid(plot_ui: &mut egui_plot::PlotUi<'_>, minimum_elevation: f64) {
+    let ring_count = ((90.0 - minimum_elevation) / 15.0).round() as usize;
+    for ring in 0..=ring_count {
+        let elevation = minimum_elevation + ring as f64 * 15.0;
+        let radius = (90.0 - elevation) / 90.0;
+        let circle_points: PlotPoints = (0..=100)
+            .map(|i| {
+                let angle = i as f64 * 2.0 * std::f64::consts::PI / 100.0;
+                [radius * angle.cos(), radius * angle.sin()]
+            })
+            .collect();
+        plot_ui.line(Line::new("", circle_points).stroke(Stroke::new(1.0, Color32::DARK_GRAY)));
+        if elevation != 90.0 {
+            let label_angle = 72.0f64.to_radians();
+            plot_ui.text(
+                egui_plot::Text::new(
+                    "",
+                    egui_plot::PlotPoint::new(
+                        radius * label_angle.cos(),
+                        radius * label_angle.sin(),
+                    ),
+                    format!("{:.0}°", elevation),
+                )
+                .color(Color32::DARK_GRAY),
+            );
+        }
+    }
+
+    let maximum_radius = (90.0 - minimum_elevation) / 90.0;
+    for azimuth in [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
+        let angle = (90.0f64 - azimuth).to_radians();
+        let line_points = vec![
+            [0.0, 0.0],
+            [maximum_radius * angle.cos(), maximum_radius * angle.sin()],
+        ];
+        plot_ui.line(
+            Line::new("", PlotPoints::from(line_points))
+                .stroke(Stroke::new(1.0, Color32::DARK_GRAY)),
+        );
+        plot_ui.text(
+            egui_plot::Text::new(
+                "",
+                egui_plot::PlotPoint::new(
+                    (maximum_radius + 0.1) * angle.cos(),
+                    (maximum_radius + 0.1) * angle.sin(),
+                ),
+                format!("{:.0}°", azimuth),
+            )
+            .color(Color32::DARK_GRAY),
+        );
+    }
+}
+
+fn azel_to_polar_points(az_points: &[[f64; 2]], el_points: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    az_points
+        .iter()
+        .zip(el_points)
+        .map(|(az_point, el_point)| {
+            let azimuth = az_point[1];
+            let elevation = el_point[1];
+            if !azimuth.is_finite() || !elevation.is_finite() || elevation <= 0.0 {
+                return [f64::NAN, f64::NAN];
+            }
+            let angle = (90.0 - azimuth).to_radians();
+            let radius = (90.0 - elevation) / 90.0;
+            [radius * angle.cos(), radius * angle.sin()]
+        })
+        .collect()
 }
 
 pub fn radec2azalt(
@@ -584,6 +683,7 @@ fn calculate_sun_segments(
     station: &Station,
     t0: NaiveDateTime,
     t_end: NaiveDateTime,
+    include_below_horizon: bool,
 ) -> (String, Vec<[f64; 2]>, Vec<[f64; 2]>) {
     let mut az_segment = Vec::new();
     let mut el_segment = Vec::new();
@@ -637,7 +737,7 @@ fn calculate_sun_segments(
             coords::az_frm_eq(hour_angle, dec_rad, latitude_radian).to_degrees() as f32 + 180.0;
         let el = coords::alt_frm_eq(hour_angle, dec_rad, latitude_radian).to_degrees() as f32;
 
-        if el >= 0.0 {
+        if el >= 0.0 || include_below_horizon {
             az_segment.push([hour_float, az as f64]);
             el_segment.push([hour_float, el as f64]);
         } else {
@@ -694,14 +794,14 @@ fn calculate_sky_segments(
             );
 
             az_segment.push([hour_float, az as f64]);
-            el_segment.push([hour_float, if el >= 0.0 { el as f64 } else { f64::NAN }]);
+            el_segment.push([hour_float, el as f64]);
             current_time += Duration::minutes(1);
         }
 
         sky_segments.push((source.name2.clone(), az_segment, el_segment));
     }
 
-    sky_segments.push(calculate_sun_segments(station, t0, t_end));
+    sky_segments.push(calculate_sun_segments(station, t0, t_end, true));
     sky_segments
 }
 
