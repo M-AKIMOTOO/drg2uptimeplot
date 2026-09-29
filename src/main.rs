@@ -45,6 +45,12 @@ struct Station {
     pos: [f64; 3],
 }
 
+struct StationPolarTracks {
+    name: String,
+    sky_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
+    drg_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
+}
+
 #[derive(Debug, Clone)]
 struct Observation {
     source_name: String,
@@ -64,6 +70,7 @@ enum AppTab {
     UptimePlot2,
     PolarPlot1,
     PolarPlot2,
+    YI,
 }
 
 // --- Plotting App ---
@@ -77,11 +84,15 @@ struct DrgPlotApp {
     selected_tab: AppTab,
     reset_plot_bounds: bool,
     hidden_targets: HashMap<AppTab, HashSet<String>>,
+    yi_yamaguchi32: StationPolarTracks,
+    yi_yamaguchi34: StationPolarTracks,
+    yi_yamaguchi34_offset_enu: [f64; 2],
 }
 
 impl DrgPlotApp {
     fn new(
         station: Station,
+        yi_stations: [Station; 2],
         drg_data: DrgData,
         x_axis_bounds: [f64; 2],
         t0: NaiveDateTime,
@@ -95,6 +106,22 @@ impl DrgPlotApp {
             calculate_observation_segments(&station, &drg_data.sources, &drg_data.schedule, t0);
         let sun_segment = calculate_sun_segments(&station, t0, t_end, false);
         plot_segments.push(sun_segment);
+
+        let yi_yamaguchi32 = calculate_station_polar_tracks(
+            &yi_stations[0],
+            &drg_data.sources,
+            &drg_data.schedule,
+            t0,
+            t_end,
+        );
+        let yi_yamaguchi34 = calculate_station_polar_tracks(
+            &yi_stations[1],
+            &drg_data.sources,
+            &drg_data.schedule,
+            t0,
+            t_end,
+        );
+        let yi_yamaguchi34_offset_enu = station_offset_enu(&yi_stations[0], &yi_stations[1]);
 
         let mut color_map = HashMap::new();
         let palette = [
@@ -129,6 +156,9 @@ impl DrgPlotApp {
             selected_tab: AppTab::UptimePlot,
             reset_plot_bounds: false,
             hidden_targets: HashMap::new(),
+            yi_yamaguchi32,
+            yi_yamaguchi34,
+            yi_yamaguchi34_offset_enu,
         }
     }
 }
@@ -141,6 +171,7 @@ impl eframe::App for DrgPlotApp {
                 ui.selectable_value(&mut self.selected_tab, AppTab::UptimePlot2, "UptimePlot2");
                 ui.selectable_value(&mut self.selected_tab, AppTab::PolarPlot1, "PolarPlot1");
                 ui.selectable_value(&mut self.selected_tab, AppTab::PolarPlot2, "PolarPlot2");
+                ui.selectable_value(&mut self.selected_tab, AppTab::YI, "YI");
 
                 ui.separator();
 
@@ -160,6 +191,7 @@ impl eframe::App for DrgPlotApp {
             AppTab::UptimePlot2 => self.ui_uptime_plot2_tab(ui),
             AppTab::PolarPlot1 => self.ui_polar_plot1_tab(ui),
             AppTab::PolarPlot2 => self.ui_polar_plot2_tab(ui),
+            AppTab::YI => self.ui_yi_tab(ui),
         });
         self.reset_plot_bounds = false;
     }
@@ -181,6 +213,12 @@ impl DrgPlotApp {
                         .map(|(name, _, _)| name.clone()),
                 );
             }
+            AppTab::YI => {
+                for tracks in [&self.yi_yamaguchi32, &self.yi_yamaguchi34] {
+                    names.extend(tracks.sky_segments.iter().map(|(name, _, _)| name.clone()));
+                    names.extend(tracks.drg_segments.iter().map(|(name, _, _)| name.clone()));
+                }
+            }
         }
         names.sort();
         names.dedup();
@@ -192,7 +230,10 @@ impl DrgPlotApp {
 
     fn ui_target_legend(&mut self, ui: &mut egui::Ui) {
         ui.heading("Targets");
-        if self.selected_tab == AppTab::UptimePlot2 || self.selected_tab == AppTab::PolarPlot2 {
+        if matches!(
+            self.selected_tab,
+            AppTab::UptimePlot2 | AppTab::PolarPlot2 | AppTab::YI
+        ) {
             ui.small("Dotted: sky   Solid: DRG");
         }
         ui.separator();
@@ -637,6 +678,119 @@ impl DrgPlotApp {
             );
         });
     }
+
+    fn ui_yi_tab(&self, ui: &mut egui::Ui) {
+        let area = ui.available_rect_before_wrap();
+        ui.allocate_rect(area, egui::Sense::hover());
+
+        let [east, north] = self.yi_yamaguchi34_offset_enu;
+        let distance = east.hypot(north);
+        let bearing = east.atan2(north).to_degrees();
+        ui.painter().text(
+            area.left_top() + egui::vec2(8.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            format!(
+                "YAMAGU34 relative to YAMAGU32: E={east:.1} m, N={north:.1} m, {distance:.1} m at {bearing:.1} deg"
+            ),
+            egui::FontId::proportional(14.0),
+            Color32::GRAY,
+        );
+
+        let chart_area = area.shrink2(egui::vec2(8.0, 28.0));
+        let chart_size = (chart_area.width() * 0.42)
+            .min(chart_area.height() * 0.42)
+            .max(1.0);
+        let baseline_direction = egui::vec2(east as f32, -(north as f32)).normalized();
+        let chart_offset = baseline_direction * (chart_size * 1.52);
+        let chart_size = egui::vec2(chart_size, chart_size);
+        let yamagu32_rect =
+            egui::Rect::from_center_size(chart_area.center() - chart_offset * 0.5, chart_size);
+        let yamagu34_rect =
+            egui::Rect::from_center_size(chart_area.center() + chart_offset * 0.5, chart_size);
+
+        self.draw_yi_station_polar(ui, yamagu32_rect, "yi_yamaguchi32", &self.yi_yamaguchi32);
+        self.draw_yi_station_polar(ui, yamagu34_rect, "yi_yamaguchi34", &self.yi_yamaguchi34);
+    }
+
+    fn draw_yi_station_polar(
+        &self,
+        parent_ui: &mut egui::Ui,
+        rect: egui::Rect,
+        plot_id: &'static str,
+        tracks: &StationPolarTracks,
+    ) {
+        let mut station_ui = parent_ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        station_ui.set_clip_rect(rect);
+        station_ui.label(&tracks.name);
+
+        let plot = Plot::new(plot_id)
+            .width(station_ui.available_width())
+            .height(station_ui.available_height())
+            .data_aspect(1.0)
+            .view_aspect(1.0)
+            .include_x(-1.0)
+            .include_x(1.0)
+            .include_y(-1.0)
+            .include_y(1.0)
+            .center_x_axis(true)
+            .center_y_axis(true)
+            .show_x(false)
+            .show_y(false)
+            .x_grid_spacer(|_input| vec![])
+            .y_grid_spacer(|_input| vec![])
+            .allow_drag(true)
+            .allow_zoom(true)
+            .allow_scroll(true);
+
+        plot.show(&mut station_ui, |plot_ui| {
+            if self.reset_plot_bounds {
+                plot_ui.set_plot_bounds(PlotBounds::from_min_max([-1.0, -1.0], [1.0, 1.0]));
+            }
+            draw_polar_grid(plot_ui, 0.0);
+
+            for (name, az_points, el_points) in &tracks.sky_segments {
+                if self.target_is_hidden(name) {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    let points = azel_to_polar_points(az_points, el_points);
+                    for points in split_finite_segments(&points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (sky)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(1.0)
+                                .style(LineStyle::dotted_dense()),
+                        );
+                    }
+                }
+            }
+
+            for (name, az_points, el_points) in &tracks.drg_segments {
+                if name == "Sun" || self.target_is_hidden(name) {
+                    continue;
+                }
+                if let Some(color) = self.color_map.get(name) {
+                    let points = azel_to_polar_points(az_points, el_points);
+                    for points in split_finite_segments(&points) {
+                        plot_ui.line(
+                            Line::new(format!("{} (DRG)", name), PlotPoints::from(points))
+                                .color(*color)
+                                .width(3.0),
+                        );
+                    }
+                }
+            }
+
+            plot_ui.points(
+                Points::new(
+                    "Antenna (AZ=244, EL=20)",
+                    PlotPoints::from(vec![azel_to_polar_point(244.0, 20.0)]),
+                )
+                .color(Color32::WHITE)
+                .radius(6.0),
+            );
+        });
+    }
 }
 
 fn draw_polar_grid(plot_ui: &mut egui_plot::PlotUi<'_>, minimum_elevation: f64) {
@@ -1030,6 +1184,37 @@ fn calculate_observation_segments(
     new_plot_data
 }
 
+fn calculate_station_polar_tracks(
+    station: &Station,
+    sources: &[Source],
+    schedule: &[Observation],
+    t0: NaiveDateTime,
+    t_end: NaiveDateTime,
+) -> StationPolarTracks {
+    StationPolarTracks {
+        name: station.name.clone(),
+        sky_segments: calculate_sky_segments(station, sources, schedule, t0, t_end),
+        drg_segments: calculate_observation_segments(station, sources, schedule, t0),
+    }
+}
+
+fn station_offset_enu(origin: &Station, target: &Station) -> [f64; 2] {
+    let origin_ecef = ECEF::new(origin.pos[0], origin.pos[1], origin.pos[2]);
+    let origin_wgs84: WGS84<f64> = origin_ecef.into();
+    let longitude = origin_wgs84.longitude_radians();
+    let latitude = origin_wgs84.latitude_radians();
+    let [dx, dy, dz] = [
+        target.pos[0] - origin.pos[0],
+        target.pos[1] - origin.pos[1],
+        target.pos[2] - origin.pos[2],
+    ];
+
+    let east = -longitude.sin() * dx + longitude.cos() * dy;
+    let north = -latitude.sin() * longitude.cos() * dx - latitude.sin() * longitude.sin() * dy
+        + latitude.cos() * dz;
+    [east, north]
+}
+
 fn write_full_track_file<P: AsRef<Path>>(
     path: P,
     station: &Station,
@@ -1275,6 +1460,18 @@ fn main() -> Result<(), eframe::Error> {
             std::process::exit(1);
         }
     };
+    let yi_stations = [
+        all_stations
+            .iter()
+            .find(|station| station.name == "YAMAGU32")
+            .expect("YAMAGU32 must be present in the internal station list")
+            .clone(),
+        all_stations
+            .iter()
+            .find(|station| station.name == "YAMAGU34")
+            .expect("YAMAGU34 must be present in the internal station list")
+            .clone(),
+    ];
 
     let drg_data = match parse_drg_file(&cli.drg_file) {
         Ok(data) => data,
@@ -1347,6 +1544,7 @@ fn main() -> Result<(), eframe::Error> {
             cc.egui_ctx.set_style(style);
             Ok(Box::new(DrgPlotApp::new(
                 selected_station,
+                yi_stations,
                 drg_data,
                 x_axis_bounds,
                 t0,
@@ -1354,4 +1552,28 @@ fn main() -> Result<(), eframe::Error> {
             )))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{get_default_stations, station_offset_enu};
+
+    #[test]
+    fn yamagu34_is_northeast_of_yamagu32() {
+        let stations = get_default_stations();
+        let yamagu32 = stations
+            .iter()
+            .find(|station| station.name == "YAMAGU32")
+            .unwrap();
+        let yamagu34 = stations
+            .iter()
+            .find(|station| station.name == "YAMAGU34")
+            .unwrap();
+        let [east, north] = station_offset_enu(yamagu32, yamagu34);
+
+        assert!(east > 0.0);
+        assert!(north > 0.0);
+        assert!((east - 70.6).abs() < 0.2);
+        assert!((north - 81.5).abs() < 0.2);
+    }
 }
