@@ -17,7 +17,7 @@ struct Cli {
     /// Path to the DRG schedule file
     drg_file: String,
 
-    /// Name of the station to use for calculations
+    /// Initial station for AZ/EL calculations (also selectable in the GUI)
     #[arg(long, default_value = "YAMAGU32")]
     station: String,
 
@@ -75,12 +75,17 @@ enum AppTab {
 
 // --- Plotting App ---
 struct DrgPlotApp {
+    selected_station: Station,
+    available_stations: Vec<Station>,
+    sources: Vec<Source>,
+    schedule: Vec<Observation>,
     sky_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
     drg_ut_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
     plot_segments: Vec<(String, Vec<[f64; 2]>, Vec<[f64; 2]>)>,
     color_map: HashMap<String, Color32>,
     x_axis_bounds: [f64; 2],
     t0: NaiveDateTime,
+    t_end: NaiveDateTime,
     selected_tab: AppTab,
     reset_plot_bounds: bool,
     hidden_targets: HashMap<AppTab, HashSet<String>>,
@@ -92,6 +97,7 @@ struct DrgPlotApp {
 impl DrgPlotApp {
     fn new(
         station: Station,
+        available_stations: Vec<Station>,
         yi_stations: [Station; 2],
         drg_data: DrgData,
         x_axis_bounds: [f64; 2],
@@ -147,12 +153,17 @@ impl DrgPlotApp {
         color_map.insert("Sun".to_string(), Color32::from_rgb(255, 255, 0)); // Yellow for Sun
 
         Self {
+            selected_station: station,
+            available_stations,
+            sources: drg_data.sources,
+            schedule: drg_data.schedule,
             sky_segments,
             drg_ut_segments,
             plot_segments,
             color_map,
             x_axis_bounds,
             t0,
+            t_end,
             selected_tab: AppTab::UptimePlot,
             reset_plot_bounds: false,
             hidden_targets: HashMap::new(),
@@ -165,6 +176,8 @@ impl DrgPlotApp {
 
 impl eframe::App for DrgPlotApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let current_station_name = self.selected_station.name.clone();
+        let mut selected_station_name = current_station_name.clone();
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.selected_tab, AppTab::UptimePlot, "UptimePlot1");
@@ -174,12 +187,37 @@ impl eframe::App for DrgPlotApp {
                 ui.selectable_value(&mut self.selected_tab, AppTab::YI, "YI");
 
                 ui.separator();
+                ui.label("Station:");
+                egui::ComboBox::from_id_salt("station_selector")
+                    .selected_text(&selected_station_name)
+                    .show_ui(ui, |ui| {
+                        for station in &self.available_stations {
+                            ui.selectable_value(
+                                &mut selected_station_name,
+                                station.name.clone(),
+                                &station.name,
+                            );
+                        }
+                    });
 
                 if ui.button("Reset Zoom").clicked() {
                     self.reset_plot_bounds = true;
                 }
             });
         });
+
+        if selected_station_name != current_station_name {
+            if let Some(station) = self
+                .available_stations
+                .iter()
+                .find(|station| station.name == selected_station_name)
+                .cloned()
+            {
+                self.selected_station = station;
+                self.recalculate_selected_station_data();
+                self.reset_plot_bounds = true;
+            }
+        }
 
         egui::SidePanel::right("target_legend_panel")
             .default_width(190.0)
@@ -198,6 +236,37 @@ impl eframe::App for DrgPlotApp {
 }
 
 impl DrgPlotApp {
+    fn recalculate_selected_station_data(&mut self) {
+        let sky_segments = calculate_ut_sky_segments(
+            &self.selected_station,
+            &self.sources,
+            &self.schedule,
+            self.t0,
+            self.t_end,
+        );
+        let drg_ut_segments = calculate_observation_segments_ut(
+            &self.selected_station,
+            &self.sources,
+            &self.schedule,
+        );
+        let mut plot_segments = calculate_observation_segments(
+            &self.selected_station,
+            &self.sources,
+            &self.schedule,
+            self.t0,
+        );
+        plot_segments.push(calculate_sun_segments(
+            &self.selected_station,
+            self.t0,
+            self.t_end,
+            false,
+        ));
+
+        self.sky_segments = sky_segments;
+        self.drg_ut_segments = drg_ut_segments;
+        self.plot_segments = plot_segments;
+    }
+
     fn target_legend_entries(&self) -> Vec<(String, Color32)> {
         let mut names = Vec::new();
         match &self.selected_tab {
@@ -1472,6 +1541,7 @@ fn main() -> Result<(), eframe::Error> {
             .expect("YAMAGU34 must be present in the internal station list")
             .clone(),
     ];
+    let available_stations = all_stations.clone();
 
     let drg_data = match parse_drg_file(&cli.drg_file) {
         Ok(data) => data,
@@ -1544,6 +1614,7 @@ fn main() -> Result<(), eframe::Error> {
             cc.egui_ctx.set_style(style);
             Ok(Box::new(DrgPlotApp::new(
                 selected_station,
+                available_stations,
                 yi_stations,
                 drg_data,
                 x_axis_bounds,
