@@ -556,6 +556,15 @@ impl DrgPlotApp {
                     }
                 }
             }
+
+            plot_ui.points(
+                Points::new(
+                    "Antenna (AZ=244, EL=20)",
+                    PlotPoints::from(vec![azel_to_polar_point(244.0, 20.0)]),
+                )
+                .color(Color32::WHITE)
+                .radius(6.0),
+            );
         });
     }
 
@@ -617,6 +626,15 @@ impl DrgPlotApp {
                     }
                 }
             }
+
+            plot_ui.points(
+                Points::new(
+                    "Antenna (AZ=244, EL=20)",
+                    PlotPoints::from(vec![azel_to_polar_point(244.0, 20.0)]),
+                )
+                .color(Color32::WHITE)
+                .radius(6.0),
+            );
         });
     }
 }
@@ -684,11 +702,15 @@ fn azel_to_polar_points(az_points: &[[f64; 2]], el_points: &[[f64; 2]]) -> Vec<[
             if !azimuth.is_finite() || !elevation.is_finite() || elevation < 5.0 {
                 return [f64::NAN, f64::NAN];
             }
-            let angle = (90.0 - azimuth).to_radians();
-            let radius = (90.0 - elevation) / 90.0;
-            [radius * angle.cos(), radius * angle.sin()]
+            azel_to_polar_point(azimuth, elevation)
         })
         .collect()
+}
+
+fn azel_to_polar_point(azimuth: f64, elevation: f64) -> [f64; 2] {
+    let angle = (90.0 - azimuth).to_radians();
+    let radius = (90.0 - elevation) / 90.0;
+    [radius * angle.cos(), radius * angle.sin()]
 }
 
 fn filter_elevation_points(points: &[[f64; 2]], minimum_elevation: f64) -> Vec<[f64; 2]> {
